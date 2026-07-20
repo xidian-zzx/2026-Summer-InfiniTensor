@@ -1,7 +1,3 @@
 /build/
-
-/log/*
-!/log/placeholder
-
-.*/
-!/.github/
+/.xmake/
+/.vscode/

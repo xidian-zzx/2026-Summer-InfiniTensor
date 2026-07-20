@@ -34,6 +34,8 @@ jobs:
 
       - name: Build
         run: xmake
+        working-directory: c++基础作业
 
       - name: Summary
-        run: xmake run summary
+        run: xmake run learn 33
+        working-directory: c++基础作业

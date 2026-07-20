@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 
 #ifndef __XMAKE__
 #define __XMAKE__ "XMAKE is not defined"
@@ -12,7 +13,17 @@ namespace fs = std::filesystem;
 constexpr static auto XMAKE = __XMAKE__;
 
 static int process_run(const char *cmd, const char *proj, const char *log) {
-    static const auto exercises = fs::current_path() / "exercises";
+    static const auto exercises = [] {
+        auto dir = fs::current_path();
+        while (!fs::exists(dir / "exercises")) {
+            const auto parent = dir.parent_path();
+            if (parent == dir) {
+                throw std::runtime_error("Cannot locate exercises directory");
+            }
+            dir = parent;
+        }
+        return dir / "exercises";
+    }();
     auto command = std::string("xmake ") + cmd + " -P \"" + exercises.string() + "\" " + proj;
     if (log) {
         command += " >> ";

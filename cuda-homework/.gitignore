@@ -1,0 +1,4 @@
+/test_kernels
+/src/*.o
+/InfiniTensor/cuda/RMSnorm/rmsnorm
+/InfiniTensor/cuda/KVcache/kvcache

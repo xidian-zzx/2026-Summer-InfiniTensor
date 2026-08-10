@@ -305,6 +305,8 @@ bool run_benchmark(int batch_size, int tokens, int max_seq_len,
 int run_tests() {
   struct Shape { int batch; int tokens; int max_seq; int heads; int dim; };
   const Shape shapes[] = {
+      {2, 1, 17, 3, 7},       // decode 的标量回退路径
+      {5, 1, 33, 8, 128},     // decode 的 16 字节向量路径
       {2, 3, 17, 3, 7},       // 标量回退路径
       {3, 5, 64, 8, 128},     // 常见 half8/float4 路径
       {1, 4, 33, 2, 64}};

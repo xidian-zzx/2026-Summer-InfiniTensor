@@ -6,8 +6,24 @@
 
 namespace {
 
-constexpr int kThreads = 256;
+#ifndef KV_DECODE_WARPS
+#define KV_DECODE_WARPS 8
+#endif
+
+#ifndef KV_BULK_THREADS
+#define KV_BULK_THREADS 0
+#endif
+
+constexpr int kWarpSize = 32;
+constexpr int kDecodeWarps = KV_DECODE_WARPS;
+constexpr int kBulkThreadsOverride = KV_BULK_THREADS;
 constexpr int kMaxBlocks = 4096;
+static_assert(kDecodeWarps > 0 && kDecodeWarps <= 32,
+              "KV_DECODE_WARPS must be in [1, 32]");
+static_assert(kBulkThreadsOverride == 0
+                  || (kBulkThreadsOverride > 0 && kBulkThreadsOverride <= 1024
+                      && kBulkThreadsOverride % kWarpSize == 0),
+              "KV_BULK_THREADS must be 0 or a warp-aligned CUDA block size");
 
 // KV Cache 的 update 和 gather 本质上都是“搬数据”，没有复杂计算。
 // 优化重点是让每个线程一次搬一小包连续元素，并让相邻线程访问相邻地址。
@@ -16,10 +32,100 @@ struct alignas(sizeof(T) * N) Pack {
   T elem[N];
 };
 
-// 把 new_k 和 new_v 放在同一个 kernel 中处理。两个张量使用完全相同的
-// 位置映射，融合后只需要读取一次 positions，也少一次 kernel 启动开销。
+// 一个 warp 专门负责一个 [batch, token, kv_head]。这样做特别适合 LLM
+// decode：每步通常只有一个新 token，但每个 token 仍有多个 KV head，
+// 可以把这些 head 同时铺到 GPU 上，而不会只启动寥寥几个 block。
+//
+// K 和 V 在同一个 kernel 中搬运。它们的位置映射完全相同，因此 position
+// 每个 warp 只读一次，地址除法也只做一次，不再让每个 Pack 重复计算。
 template<typename T, int PackSize>
 __global__ void kv_cache_update_kernel(
+    const T* __restrict__ new_k, const T* __restrict__ new_v,
+    const int* __restrict__ positions, T* __restrict__ cache_k,
+    T* __restrict__ cache_v, int max_seq_len, int kv_heads, int head_dim,
+    int packs_per_head) {
+  using PackT = Pack<T, PackSize>;
+  const PackT* packed_new_k = reinterpret_cast<const PackT*>(new_k);
+  const PackT* packed_new_v = reinterpret_cast<const PackT*>(new_v);
+  PackT* packed_cache_k = reinterpret_cast<PackT*>(cache_k);
+  PackT* packed_cache_v = reinterpret_cast<PackT*>(cache_v);
+
+  const int lane = threadIdx.x & (kWarpSize - 1);
+  const int warp_in_block = threadIdx.x / kWarpSize;
+  const int warps_per_block = blockDim.x / kWarpSize;
+
+  // grid.x 直接就是 batch，grid.y 表示这一批 head 的第几组。这样 kernel
+  // 里不用再拿线性编号反复做除法和取模，decode 的小工作量会更划算。
+  const int batch = static_cast<int>(blockIdx.x);
+  const int head = static_cast<int>(blockIdx.y) * warps_per_block + warp_in_block;
+  __shared__ int position;
+  if (threadIdx.x == 0) { position = positions[batch]; }
+  __syncthreads();
+  if (head >= kv_heads
+      || static_cast<unsigned int>(position)
+             >= static_cast<unsigned int>(max_seq_len)) {
+    return;
+  }
+
+  // 同一个 block 的几个 warp 属于同一个 batch，所以 position 也只读一次。
+  const int64_t source_element =
+      (static_cast<int64_t>(batch) * kv_heads + head) * head_dim;
+  const int64_t destination_element =
+      ((static_cast<int64_t>(batch) * max_seq_len + position) * kv_heads + head)
+      * head_dim;
+  const int64_t source_pack = source_element / PackSize;
+  const int64_t destination_pack = destination_element / PackSize;
+  for (int pack = lane; pack < packs_per_head; pack += kWarpSize) {
+    packed_cache_k[destination_pack + pack] = packed_new_k[source_pack + pack];
+    packed_cache_v[destination_pack + pack] = packed_new_v[source_pack + pack];
+  }
+}
+
+// gather 与 update 的地址映射方向相反：从大缓存的指定 position 读取，
+// 再连续写入紧凑的 [B, Trequested, H, D] 输出。
+template<typename T, int PackSize>
+__global__ void kv_cache_gather_kernel(
+    const T* __restrict__ cache_k, const T* __restrict__ cache_v,
+    const int* __restrict__ positions, T* __restrict__ out_k,
+    T* __restrict__ out_v, int max_seq_len, int kv_heads, int head_dim,
+    int packs_per_head) {
+  using PackT = Pack<T, PackSize>;
+  const PackT* packed_cache_k = reinterpret_cast<const PackT*>(cache_k);
+  const PackT* packed_cache_v = reinterpret_cast<const PackT*>(cache_v);
+  PackT* packed_out_k = reinterpret_cast<PackT*>(out_k);
+  PackT* packed_out_v = reinterpret_cast<PackT*>(out_v);
+
+  const int lane = threadIdx.x & (kWarpSize - 1);
+  const int warp_in_block = threadIdx.x / kWarpSize;
+  const int warps_per_block = blockDim.x / kWarpSize;
+  const int batch = static_cast<int>(blockIdx.x);
+  const int head = static_cast<int>(blockIdx.y) * warps_per_block + warp_in_block;
+  __shared__ int position;
+  if (threadIdx.x == 0) { position = positions[batch]; }
+  __syncthreads();
+  if (head >= kv_heads
+      || static_cast<unsigned int>(position)
+             >= static_cast<unsigned int>(max_seq_len)) {
+    return;
+  }
+
+  const int64_t source_element =
+      ((static_cast<int64_t>(batch) * max_seq_len + position) * kv_heads + head)
+      * head_dim;
+  const int64_t destination_element =
+      (static_cast<int64_t>(batch) * kv_heads + head) * head_dim;
+  const int64_t source_pack = source_element / PackSize;
+  const int64_t destination_pack = destination_element / PackSize;
+  for (int pack = lane; pack < packs_per_head; pack += kWarpSize) {
+    packed_out_k[destination_pack + pack] = packed_cache_k[source_pack + pack];
+    packed_out_v[destination_pack + pack] = packed_cache_v[source_pack + pack];
+  }
+}
+
+// 多 token 的 prefill 场景已经有足够大的数据量，直接把所有 Pack 平铺给
+// 256 个线程更容易跑满带宽。它保留为 bulk 路径，与上面的 decode 路径互补。
+template<typename T, int PackSize>
+__global__ void kv_cache_update_bulk_kernel(
     const T* __restrict__ new_k, const T* __restrict__ new_v,
     const int* __restrict__ positions, T* __restrict__ cache_k,
     T* __restrict__ cache_v, int new_tokens, int max_seq_len,
@@ -30,30 +136,19 @@ __global__ void kv_cache_update_kernel(
   PackT* packed_cache_k = reinterpret_cast<PackT*>(cache_k);
   PackT* packed_cache_v = reinterpret_cast<PackT*>(cache_v);
 
-  // grid-stride loop 让 kernel 能处理任意数量的 token。即使为了控制 block
-  // 数量把 grid 截到 4096，每个线程也会继续处理后面的 Pack。
   for (int64_t pack_id = static_cast<int64_t>(blockIdx.x) * blockDim.x
                          + threadIdx.x;
        pack_id < total_packs;
        pack_id += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    // pack_id 是整个 [B, Tnew, H, D] 的线性 Pack 编号。先除以
-    // packs_per_token 找到它属于第几个 token，再把 token_id 拆成 batch
-    // 和 batch 内的 token。可以把这几行理解成“把一维下标还原成多维坐标”。
-    const int64_t token_id = pack_id / packs_per_token;
+    const int64_t linear_token = pack_id / packs_per_token;
     const int pack_in_token = static_cast<int>(pack_id % packs_per_token);
-    const int batch = static_cast<int>(token_id / new_tokens);
-    const int token = static_cast<int>(token_id % new_tokens);
+    const int batch = static_cast<int>(linear_token / new_tokens);
+    const int token = static_cast<int>(linear_token % new_tokens);
     const int position = positions[batch * new_tokens + token];
-
-    // positions 位于显存，host 启动函数无法逐个检查。这里保留边界保护，
-    // 防止错误位置造成越界写；正常调用应提前保证每个位置都合法。
     if (static_cast<unsigned int>(position)
         >= static_cast<unsigned int>(max_seq_len)) {
       continue;
     }
-
-    // 源张量是 [B, Tnew, H, D]，pack_id 本身就是源 Pack 的线性下标。
-    // 目标张量是 [B, Smax, H, D]，只需把 token 维换成 position。
     const int64_t destination_element =
         (static_cast<int64_t>(batch) * max_seq_len + position)
         * elements_per_token;
@@ -64,10 +159,8 @@ __global__ void kv_cache_update_kernel(
   }
 }
 
-// gather 与 update 的地址映射方向相反：从大缓存的指定 position 读取，
-// 再连续写入紧凑的 [B, Trequested, H, D] 输出。
 template<typename T, int PackSize>
-__global__ void kv_cache_gather_kernel(
+__global__ void kv_cache_gather_bulk_kernel(
     const T* __restrict__ cache_k, const T* __restrict__ cache_v,
     const int* __restrict__ positions, T* __restrict__ out_k,
     T* __restrict__ out_v, int requested_tokens, int max_seq_len,
@@ -82,18 +175,15 @@ __global__ void kv_cache_gather_kernel(
                          + threadIdx.x;
        pack_id < total_packs;
        pack_id += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    // 输出是连续存放的，所以 pack_id 直接表示输出位置；下面只需要算出
-    // 对应的 batch 和 position，找到大缓存中的源地址。
-    const int64_t token_id = pack_id / packs_per_token;
+    const int64_t linear_token = pack_id / packs_per_token;
     const int pack_in_token = static_cast<int>(pack_id % packs_per_token);
-    const int batch = static_cast<int>(token_id / requested_tokens);
-    const int token = static_cast<int>(token_id % requested_tokens);
+    const int batch = static_cast<int>(linear_token / requested_tokens);
+    const int token = static_cast<int>(linear_token % requested_tokens);
     const int position = positions[batch * requested_tokens + token];
     if (static_cast<unsigned int>(position)
         >= static_cast<unsigned int>(max_seq_len)) {
       continue;
     }
-
     const int64_t source_element =
         (static_cast<int64_t>(batch) * max_seq_len + position)
         * elements_per_token;
@@ -103,10 +193,29 @@ __global__ void kv_cache_gather_kernel(
   }
 }
 
-inline int choose_blocks(int64_t work_items) {
-  // 小任务按实际工作量启动 block；大任务最多启动 4096 个 block，剩余工作
-  // 交给 kernel 内的 grid-stride loop。block 太多只会增加调度开销。
-  const int64_t needed = (work_items + kThreads - 1) / kThreads;
+// 4090D 的 SM 8.9 在实测里更喜欢 512 线程，3080 的 SM 8.6 处理大工作集时
+// 256 线程更稳。第一次调用时查一次设备，后续直接拿缓存结果，不往热路径里
+// 塞重复的 CUDA Runtime 查询。编译时传 KV_BULK_THREADS 还能强制覆盖，方便调参。
+inline int choose_bulk_threads() {
+  if constexpr (kBulkThreadsOverride != 0) { return kBulkThreadsOverride; }
+  static const int threads = [] {
+    int device = 0;
+    int major = 0;
+    int minor = 0;
+    if (cudaGetDevice(&device) != cudaSuccess
+        || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
+                                  device) != cudaSuccess
+        || cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
+                                  device) != cudaSuccess) {
+      return 256;
+    }
+    return major > 8 || (major == 8 && minor >= 9) ? 512 : 256;
+  }();
+  return threads;
+}
+
+inline int choose_bulk_blocks(int64_t total_packs, int threads) {
+  const int64_t needed = (total_packs + threads - 1) / threads;
   return static_cast<int>(std::max<int64_t>(1, std::min<int64_t>(needed, kMaxBlocks)));
 }
 
@@ -115,16 +224,30 @@ cudaError_t launch_update_pack(
     const T* new_k, const T* new_v, const int* positions,
     T* cache_k, T* cache_v, int batch_size, int new_tokens,
     int max_seq_len, int kv_heads, int head_dim, cudaStream_t stream) {
-  const int elements_per_token = kv_heads * head_dim;
-  // 一个 token 的 K 或 V 有 Hkv * D 个元素。除以 PackSize 后，就得到
-  // 搬完一个 token 需要多少次 Pack 访问。
-  const int packs_per_token = elements_per_token / PackSize;
-  const int64_t total_packs =
-      static_cast<int64_t>(batch_size) * new_tokens * packs_per_token;
+  if (new_tokens > 1) {
+    const int elements_per_token = kv_heads * head_dim;
+    const int packs_per_token = elements_per_token / PackSize;
+    const int64_t total_packs =
+        static_cast<int64_t>(batch_size) * new_tokens * packs_per_token;
+    const int threads = choose_bulk_threads();
+    kv_cache_update_bulk_kernel<T, PackSize>
+        <<<choose_bulk_blocks(total_packs, threads), threads, 0, stream>>>(
+            new_k, new_v, positions, cache_k, cache_v, new_tokens, max_seq_len,
+            elements_per_token, packs_per_token, total_packs);
+    return cudaPeekAtLastError();
+  }
+
+  const int packs_per_head = head_dim / PackSize;
+  // 每个 warp 仍然独立处理一个 head，不过把 8 个 warp 塞进同一个 block。
+  // 常见的 8 个 KV head 正好一次覆盖，能少付一些小 block 的调度成本。
+  const int warps_per_block = kDecodeWarps;
+  const int threads = warps_per_block * kWarpSize;
+  const dim3 blocks(batch_size,
+                    (kv_heads + warps_per_block - 1) / warps_per_block);
   kv_cache_update_kernel<T, PackSize>
-      <<<choose_blocks(total_packs), kThreads, 0, stream>>>(
-          new_k, new_v, positions, cache_k, cache_v, new_tokens, max_seq_len,
-          elements_per_token, packs_per_token, total_packs);
+      <<<blocks, threads, 0, stream>>>(new_k, new_v, positions, cache_k, cache_v,
+                                      max_seq_len, kv_heads, head_dim,
+                                      packs_per_head);
   return cudaPeekAtLastError();
 }
 
@@ -133,14 +256,28 @@ cudaError_t launch_gather_pack(
     const T* cache_k, const T* cache_v, const int* positions,
     T* out_k, T* out_v, int batch_size, int requested_tokens,
     int max_seq_len, int kv_heads, int head_dim, cudaStream_t stream) {
-  const int elements_per_token = kv_heads * head_dim;
-  const int packs_per_token = elements_per_token / PackSize;
-  const int64_t total_packs =
-      static_cast<int64_t>(batch_size) * requested_tokens * packs_per_token;
+  if (requested_tokens > 1) {
+    const int elements_per_token = kv_heads * head_dim;
+    const int packs_per_token = elements_per_token / PackSize;
+    const int64_t total_packs =
+        static_cast<int64_t>(batch_size) * requested_tokens * packs_per_token;
+    const int threads = choose_bulk_threads();
+    kv_cache_gather_bulk_kernel<T, PackSize>
+        <<<choose_bulk_blocks(total_packs, threads), threads, 0, stream>>>(
+            cache_k, cache_v, positions, out_k, out_v, requested_tokens,
+            max_seq_len, elements_per_token, packs_per_token, total_packs);
+    return cudaPeekAtLastError();
+  }
+
+  const int packs_per_head = head_dim / PackSize;
+  const int warps_per_block = kDecodeWarps;
+  const int threads = warps_per_block * kWarpSize;
+  const dim3 blocks(batch_size,
+                    (kv_heads + warps_per_block - 1) / warps_per_block);
   kv_cache_gather_kernel<T, PackSize>
-      <<<choose_blocks(total_packs), kThreads, 0, stream>>>(
-          cache_k, cache_v, positions, out_k, out_v, requested_tokens,
-          max_seq_len, elements_per_token, packs_per_token, total_packs);
+      <<<blocks, threads, 0, stream>>>(cache_k, cache_v, positions, out_k, out_v,
+                                      max_seq_len, kv_heads, head_dim,
+                                      packs_per_head);
   return cudaPeekAtLastError();
 }
 
@@ -168,17 +305,18 @@ cudaError_t update_impl(
     return cudaErrorInvalidValue;
   }
 
-  // Pack 的边界不能跨 token，否则目标 position 改变后地址就不再连续。
-  // 因此按照 kv_heads * head_dim 能否整除来选择向量宽度。
-  const int elements_per_token = kv_heads * head_dim;
+  // 解码路径里，一个 warp 负责一个 head，Pack 不能跨过 head_dim 边界；
+  // 批量路径按整个 token 摊平，所以只要 H * D 能整除 Pack 就行。
+  const int vector_width_basis =
+      new_tokens == 1 ? head_dim : kv_heads * head_dim;
   if constexpr (std::is_same<T, half>::value) {
-    if (elements_per_token % 8 == 0) {
+    if (vector_width_basis % 8 == 0) {
       return launch_update_pack<T, 8>(new_k, new_v, positions, cache_k, cache_v,
                                       batch_size, new_tokens, max_seq_len,
                                       kv_heads, head_dim, stream);
     }
   } else {
-    if (elements_per_token % 4 == 0) {
+    if (vector_width_basis % 4 == 0) {
       return launch_update_pack<T, 4>(new_k, new_v, positions, cache_k, cache_v,
                                       batch_size, new_tokens, max_seq_len,
                                       kv_heads, head_dim, stream);
@@ -200,15 +338,16 @@ cudaError_t gather_impl(
     return cudaErrorInvalidValue;
   }
 
-  const int elements_per_token = kv_heads * head_dim;
+  const int vector_width_basis =
+      requested_tokens == 1 ? head_dim : kv_heads * head_dim;
   if constexpr (std::is_same<T, half>::value) {
-    if (elements_per_token % 8 == 0) {
+    if (vector_width_basis % 8 == 0) {
       return launch_gather_pack<T, 8>(cache_k, cache_v, positions, out_k, out_v,
                                       batch_size, requested_tokens, max_seq_len,
                                       kv_heads, head_dim, stream);
     }
   } else {
-    if (elements_per_token % 4 == 0) {
+    if (vector_width_basis % 4 == 0) {
       return launch_gather_pack<T, 4>(cache_k, cache_v, positions, out_k, out_v,
                                       batch_size, requested_tokens, max_seq_len,
                                       kv_heads, head_dim, stream);

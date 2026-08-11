@@ -1,0 +1,5 @@
+torch
+transformers
+safetensors
+triton>=3.2
+pytest

@@ -54,17 +54,17 @@ cmake --build cmake-build -j
 
 程序还支持 `--rows`、`--cols`、`--local`、`--warmup`、`--iterations` 和 `--kernel`。其中 `cols` 必须是 32 的倍数，`local` 必须是 2 的幂；想看全部参数可以运行 `./build/gemv_opencl --help`。
 
-## 本机实测
+## 实测结果
 
-测试环境是 WSL2、PoCL 1.8、`pthread-Intel Core Ultra 7 265K`。WSL 当前的 NVIDIA 驱动只提供 CUDA，没有提供 Linux OpenCL ICD，所以这组数字是 CPU OpenCL 后端结果；换到 GPU 后请重新跑一次，性能数字不能混用。
-
-原始尺寸 `M=122753、K=2304`，`local=64`，预热 2 次、统计 20 次：
+GPU 环境是 Ubuntu 24.04、NVIDIA OpenCL、RTX 4090 D 24GB，驱动 `570.124.06`。原始尺寸 `M=122753、K=2304`，`local=32`，预热 10 次、统计 100 次：
 
 | kernel | 平均时间 | 相对基线 | kernel 最大误差 | 含量化最大误差 |
 |---|---:|---:|---:|---:|
-| `gemv_q8_fp16_scalar` | 39.3110 ms | 1.0000× | 0 | 3.605e-2 |
-| `gemv_q8_fp16_local` | 27.3745 ms | 1.4360× | 2.861e-6 | 3.605e-2 |
-| `gemv_q8_q8_local` | 6.3722 ms | 6.1692× | 2.861e-6 | 4.638e-2 |
-| `gemv_q8_q8_dot4_local` | 11.6290 ms | 3.3804× | 2.861e-6 | 4.638e-2 |
+| `gemv_q8_fp16_scalar` | 3.9109 ms | 1.0000× | 1.907e-6 | 3.605e-2 |
+| `gemv_q8_fp16_local` | 0.7360 ms | 5.3140× | 2.861e-6 | 3.605e-2 |
+| `gemv_q8_q8_local` | 0.4981 ms | 7.8522× | 3.338e-6 | 4.638e-2 |
+| `gemv_q8_q8_dot4_local` | 0.4979 ms | 7.8544× | 3.338e-6 | 4.638e-2 |
 
-`kernel 最大误差`拿 OpenCL 输出和对应的量化 CPU 参考比较，用来检查 kernel 写对没有；`含量化最大误差`拿结果和原始 fp16 权重、fp16 激活的 CPU 结果比较，也把量化损失算进去了。PoCL 上标量 int8 点积更快，说明 `dot4` 是否划算取决于设备编译器和硬件，提交里保留两版便于在目标 GPU 上实测选择。
+`kernel 最大误差`拿 OpenCL 输出和对应的量化 CPU 参考比较，用来检查 kernel 写对没有；`含量化最大误差`拿结果和原始 fp16 权重、fp16 激活的 CPU 结果比较，也把量化损失算进去了。4090D 上 `local=32` 最快，Q8×Q8 的标量版和 dot4 版性能接近，提交里保留两版方便换设备后继续比较。
+
+本地 WSL2 还用 PoCL/CPU 后端做过交叉验证，四个 kernel 的最大实现误差都在 `3.0e-6` 左右。CPU 与 GPU 的性能数字没有可比性，这组测试只用来确认跨平台编译和计算结果一致。

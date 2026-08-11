@@ -26,7 +26,7 @@ constexpr cl_int kPlatformNotFound = -1001;
 struct Options {
     int rows = 122753;
     int cols = 2304;
-    int local_size = 64;
+    int local_size = 32;
     int warmup = 10;
     int iterations = 100;
     float alpha = 0.5f;
